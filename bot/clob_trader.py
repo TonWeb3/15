@@ -151,15 +151,32 @@ class ClobTrader:
 
     def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
         """(signature_type, address) candidates derived from the EOA, deposit-wallet
-        (V2) first, then legacy proxy / safe."""
+        (V2) first, then legacy proxy / safe, and previous active maker address."""
         out: List[Tuple[int, str]] = []
+        try:
+            from polymarket_apis.clients.clob_client import PolymarketClobClient
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=0)
+            c.set_api_creds(self._derive_creds())
+            trades = c.get_trades()
+            if trades:
+                first = trades[0]
+                m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
+                if m_addr:
+                    out.append((3, m_addr))
+        except Exception:
+            pass
+
         for st, getter in (
             (3, gasless.get_expected_deposit_wallet),
             (1, gasless.get_poly_proxy_wallet_address),
             (2, gasless.get_safe_proxy_wallet_address),
         ):
             try:
-                out.append((st, getter()))
+                addr = getter()
+                if not any(a.lower() == addr.lower() for _, a in out):
+                    out.append((st, addr))
             except Exception:
                 pass
         return out
@@ -167,6 +184,23 @@ class ClobTrader:
     def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
         """Trade from where the money actually is: pick the candidate holding pUSD.
         Falls back to the deposit wallet when every balance reads 0."""
+        try:
+            from polymarket_apis.clients.clob_client import PolymarketClobClient
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=3)
+            c.set_api_creds(self._derive_creds())
+            clob_bal = float(c.get_pusd_balance())
+            if clob_bal > 0:
+                trades = c.get_trades()
+                if trades:
+                    first = trades[0]
+                    m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
+                    if m_addr:
+                        return 3, m_addr
+        except Exception:
+            pass
+
         best = None  # (sig_type, addr, balance)
         for st, addr in self._candidate_wallets(gasless):
             try:
@@ -252,7 +286,7 @@ class ClobTrader:
             price=round(float(price), 4) if price else 0,
             order_type=ot,
         )
-        resp = self.clob.create_and_post_market_order(args, order_type=ot)
+        resp = self.clob.create_and_post_market_order(args)
         if resp is None:
             return {"ok": False, "error": "no_response_from_clob", "response": {}}
 
@@ -300,10 +334,12 @@ class ClobTrader:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
-        # Ensure the deposit wallet is deployed + approved before the first order.
-        setup = self.ensure_setup()
-        if not setup.get("ok") and setup.get("error") != "missing_relayer_api_key":
-            return {"ok": False, "error": f"setup_failed: {setup.get('error')}"}
+        # Ensure the deposit wallet is deployed + approved before the first order if relayer key is present.
+        if not self._approvals_done and settings.RELAYER_API_KEY:
+            try:
+                self.ensure_setup()
+            except Exception:
+                pass
         try:
             from polymarket_apis.types.clob_types import OrderType
             limit = min(0.99, float(price) + settings.CLOB_MAX_SLIPPAGE) if price and price > 0 else 0
@@ -333,9 +369,11 @@ class ClobTrader:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
-        setup = self.ensure_setup()
-        if not setup.get("ok") and setup.get("error") != "missing_relayer_api_key":
-            return {"ok": False, "error": f"setup_failed: {setup.get('error')}"}
+        if not self._approvals_done and settings.RELAYER_API_KEY:
+            try:
+                self.ensure_setup()
+            except Exception:
+                pass
         try:
             from polymarket_apis.types.clob_types import OrderArgs, OrderType
             order_price = round(float(price), 4)

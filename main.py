@@ -545,6 +545,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             msg = (f"LIVE trade FILLED (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
                    f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {trade['live_order_id']})")
             log_message(msg)
+            log_message(f"Confirmed: Trade OPENED on both PAPER (${trade['paper_amount']:.2f}) and LIVE (${fill_usd:.2f})!")
             await send_telegram(f"🚀 *LIVE Copy FILLED (Attempt #{attempt_num})*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}` (Paper: `{trade['paper_entry_price']:.4f}`)\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
             return
         else:
@@ -557,102 +558,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 await broadcast_state()
                 return
 
-            log_message(f"LIVE copy attempt #{attempt_num} for {side} @ {current_ask:.4f} [FAK]: {err} — placing GTC limit fallback (+5¢ buffer)...")
-
-            # Fallback: Place GTC Limit Buy with +5¢ buffer
-            gtc_price = min(0.99, round(current_ask + 0.05, 4))
-            gtc_shares = round(live_amount / gtc_price, 2)
-            if gtc_shares > 0:
-                gtc_res = await asyncio.to_thread(clob_trader.place_limit_buy, token_id, gtc_shares, gtc_price)
-                if gtc_res.get("ok") and gtc_res.get("order_id"):
-                    order_id = gtc_res["order_id"]
-                    trade["live_status"] = "GTC_OPEN"
-                    trade["live_order_id"] = order_id
-                    trade["live_limit_price"] = gtc_price
-                    trade["live_quoted_price"] = current_ask
-                    save_state()
-                    _sync_active_trades_to_latest_data()
-                    await broadcast_state()
-                    log_message(f"LIVE GTC limit order placed for {side}: {gtc_shares:.2f} shares @ {gtc_price:.4f} (order {order_id}) — resting on book")
-
-                    # Monitor GTC order until filled, window expires (<30s), or FLIP
-                    while trade["status"] == "OPEN" and trade.get("live_status") == "GTC_OPEN":
-                        now_ts = time.time()
-                        if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
-                            log_message(f"Cancelling resting GTC order {order_id}: window near expiry (<{settings.COPY_MIN_REMAINING_S}s)")
-                            await asyncio.to_thread(clob_trader.cancel_order, order_id)
-                            trade["live_status"] = "TIMEOUT"
-                            save_state()
-                            _sync_active_trades_to_latest_data()
-                            await broadcast_state()
-                            return
-
-                        # Check status on CLOB
-                        ord_status = await asyncio.to_thread(clob_trader.check_order_status, order_id)
-                        st = ord_status.get("status")
-
-                        if st == "FILLED":
-                            trade["live_status"] = "FILLED"
-                            fill_size = float(ord_status.get("size_matched") or gtc_shares)
-                            fill_price = float(ord_status.get("price") or gtc_price)
-                            fill_usd = fill_size * fill_price
-                            trade["live_entry_price"] = fill_price
-                            trade["live_shares"] = fill_size
-                            trade["live_amount"] = fill_usd
-                            trade["live_entry_time"] = datetime.now().isoformat()
-                            save_state()
-                            _sync_active_trades_to_latest_data()
-                            await broadcast_state()
-
-                            msg = (f"LIVE trade FILLED via GTC limit: {side} ${fill_usd:.2f} on {trade['market_slug']} "
-                                   f"— {fill_size:.2f} shares @ {fill_price:.4f} (order {order_id})")
-                            log_message(msg)
-                            await send_telegram(f"🚀 *LIVE Copy FILLED (GTC Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
-                            return
-
-                        elif st == "CLOSED":
-                            # Order is no longer open; check if it was filled or closed
-                            last_fill = await asyncio.to_thread(clob_trader.get_last_fill, token_id)
-                            if last_fill and last_fill.get("size"):
-                                trade["live_status"] = "FILLED"
-                                fill_size = float(last_fill["size"])
-                                fill_price = float(last_fill["price"] or gtc_price)
-                                fill_usd = fill_size * fill_price
-                                trade["live_entry_price"] = fill_price
-                                trade["live_shares"] = fill_size
-                                trade["live_amount"] = fill_usd
-                                trade["live_entry_time"] = datetime.now().isoformat()
-                                save_state()
-                                _sync_active_trades_to_latest_data()
-                                await broadcast_state()
-                                log_message(f"LIVE GTC fill confirmed from CLOB trades: {side} {fill_size:.2f} shares @ {fill_price:.4f}")
-                                return
-                            else:
-                                log_message(f"GTC order {order_id} closed without fill — re-attempting live entry...")
-                                trade["live_status"] = "FILLING"
-                                break
-
-                        # Check if partial fill happened
-                        matched = ord_status.get("size_matched", 0.0)
-                        if matched > 0 and matched != trade.get("live_shares"):
-                            trade["live_shares"] = matched
-                            trade["live_entry_price"] = float(ord_status.get("price") or gtc_price)
-                            save_state()
-                            _sync_active_trades_to_latest_data()
-                            await broadcast_state()
-
-                        # Dynamic Re-quote: If market ask moved above our resting limit, cancel and re-place higher so we don't miss the trade
-                        fresh_summary = polymarket_clob_ws.get_summary(token_id, max_age_s=2.0)
-                        fresh_ask = fresh_summary.get("bestAsk") if fresh_summary else None
-                        if fresh_ask and fresh_ask > (gtc_price + 0.01):
-                            log_message(f"Market moved higher (ask {fresh_ask:.4f} > limit {gtc_price:.4f}) — cancelling and re-quoting to guarantee fill...")
-                            await asyncio.to_thread(clob_trader.cancel_order, order_id)
-                            trade["live_status"] = "FILLING"
-                            break
-
-                        await asyncio.sleep(1.0)
-                    if trade.get("live_status") == "FILLED":
-                        return
+            log_message(f"LIVE copy attempt #{attempt_num} for {side} @ {current_ask:.4f} [FAK]: {err} - retrying FAK in {int(retry_interval * 1000)}ms until opened...")
 
         await asyncio.sleep(retry_interval)
 
