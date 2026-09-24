@@ -530,6 +530,27 @@ class ClobTrader:
                     bal = None
                 wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
             sig_type, funder = self._pick_funded_wallet(probe)
+
+            # Query CLOB API directly for true tradeable balance
+            clob_bal = None
+            try:
+                from polymarket_apis.clients.clob_client import PolymarketClobClient
+                c = PolymarketClobClient(
+                    private_key=settings.PRIVATE_KEY,
+                    address=funder,
+                    chain_id=137,
+                    signature_type=sig_type
+                )
+                c.set_api_creds(c.create_or_derive_api_creds())
+                clob_bal = float(c.get_pusd_balance())
+            except Exception:
+                pass
+
+            if clob_bal is not None and clob_bal > 0:
+                for w in wallets:
+                    if w["signature_type"] == sig_type:
+                        w["pusd_balance"] = clob_bal
+
             return {
                 "ok": True,
                 "eoa": eoa,
@@ -546,6 +567,16 @@ class ClobTrader:
         V2 collateral; this is the deposit wallet's tradeable balance."""
         if not settings.PRIVATE_KEY:
             return None
+        # First priority: Query Polymarket CLOB API directly (accurate for CLOB deposits)
+        try:
+            if self.ensure_ready() and self.clob is not None:
+                c_bal = float(self.clob.get_pusd_balance())
+                if c_bal is not None and c_bal >= 0:
+                    return c_bal
+        except Exception:
+            pass
+
+        # Fallback to gasless / on-chain query
         try:
             if self.ready and self.gasless is not None and self.funder:
                 return float(self.gasless.get_pusd_balance(address=self.funder))
