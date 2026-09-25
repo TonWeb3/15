@@ -1029,7 +1029,11 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
         return
     if not settings.PRIVATE_KEY:
         return
-    dest_address = settings.WITHDRAW_ADDRESS or (clob_trader.get_eoa_address() if clob_trader else None)
+    raw_dest = (settings.WITHDRAW_ADDRESS or "").strip()
+    if raw_dest.startswith("0x") and len(raw_dest) == 42:
+        dest_address = raw_dest
+    else:
+        dest_address = clob_trader.get_eoa_address() if clob_trader else None
     if not dest_address or settings.WITHDRAW_AMOUNT <= 0:
         return
 
@@ -1887,8 +1891,13 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
         recip = ce.get("recipient_address") if "recipient_address" in ce else ce.get("withdraw_address")
         if recip is not None:
-            settings.WITHDRAW_ADDRESS = str(recip).strip()
-            ce["recipient_address"] = settings.WITHDRAW_ADDRESS
+            recip_str = str(recip).strip()
+            # If browser autofill sent "admin" or invalid string, sanitize to blank
+            if recip_str and (not recip_str.startswith("0x") or len(recip_str) != 42):
+                recip_str = ""
+            settings.WITHDRAW_ADDRESS = recip_str
+            ce["recipient_address"] = recip_str
+            ce["withdraw_address"] = recip_str
         auto_res = ce.get("auto_resume") if "auto_resume" in ce else ce.get("auto_resume_after_withdrawal")
         if auto_res is not None:
             settings.WITHDRAW_AUTO_RESUME = bool(auto_res)
@@ -1934,7 +1943,22 @@ async def post_settings(new_settings: Dict[str, Any]):
     return {"status": "ok"}
 
 @app.post("/api/setup-wallet")
-async def setup_wallet():
+async def setup_wallet(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from bot.config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
+    rk = body.get("relayer_api_key")
+    if rk and "..." not in rk:
+        settings.RELAYER_API_KEY = rk
+    ak = body.get("alchemy_api_key")
+    if ak and "..." not in ak:
+        settings.ALCHEMY_API_KEY = ak
+    clob_trader.reset()
     try:
         result = await asyncio.to_thread(clob_trader.ensure_setup)
         if result.get("ok"):
@@ -1944,33 +1968,101 @@ async def setup_wallet():
                 log_message(f"Wallet setup complete ({result.get('approvals', 0)} approvals)")
         else:
             log_message(f"Wallet setup failed: {result.get('error')}")
-        return result
     except Exception as e:
         log_message(f"Wallet setup error: {e}")
-        return {"ok": False, "error": str(e)}
+        result = {"ok": False, "error": str(e)}
+
+    eoa_addr = clob_trader.get_eoa_address() if clob_trader else None
+    if not eoa_addr and settings.PRIVATE_KEY:
+        try:
+            from eth_account import Account
+            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
+        except Exception:
+            pass
+    result["eoa"] = eoa_addr
+    result["funder"] = (clob_trader.get_funder_address() if clob_trader else None) or eoa_addr
+    return result
 
 @app.post("/api/test-connection")
-async def test_connection():
+async def test_connection(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from bot.config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
+    rk = body.get("relayer_api_key")
+    if rk and "..." not in rk:
+        settings.RELAYER_API_KEY = rk
+    ak = body.get("alchemy_api_key")
+    if ak and "..." not in ak:
+        settings.ALCHEMY_API_KEY = ak
+    clob_trader.reset()
     try:
         result = await asyncio.to_thread(clob_trader.test_connection)
         if result.get("ok"):
             log_message(f"Connection OK — EOA {result.get('eoa')}, trading from "
                         f"{result.get('funder')} (sig type {result.get('chosen_signature_type')})")
         else:
-            log_message(f"Connection test failed: {result.get('error')}")
-        return result
+            log_message(f"Connection test: {result.get('error')}")
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        result = {"ok": False, "error": str(e)}
+
+    # Always guarantee EOA address resolution if key is present
+    eoa_addr = result.get("eoa") or (clob_trader.get_eoa_address() if clob_trader else None)
+    if not eoa_addr and settings.PRIVATE_KEY:
+        try:
+            from eth_account import Account
+            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
+            result["eoa"] = eoa_addr
+        except Exception:
+            pass
+
+    # Resolve withdrawal destination details
+    withdraw_addr = (body.get("withdraw_address") or settings.WITHDRAW_ADDRESS or "").strip()
+    is_valid_eth = bool(withdraw_addr.startswith("0x") and len(withdraw_addr) == 42)
+    is_blank = not bool(withdraw_addr) or not is_valid_eth
+    dest = eoa_addr if is_blank else withdraw_addr
+
+    result["withdraw_address"] = withdraw_addr
+    result["withdraw_destination"] = dest
+    result["withdraw_is_eoa"] = is_blank
+    result["withdraw_enabled"] = bool(body.get("withdraw_enabled", settings.AUTO_WITHDRAW_ENABLED))
+    result["withdraw_amount"] = float(body.get("withdraw_amount", settings.WITHDRAW_AMOUNT))
+    result["withdraw_trigger"] = float(body.get("withdraw_trigger", settings.WITHDRAW_TRIGGER_BALANCE))
+
+    return result
 
 @app.post("/api/enable-auto-redeem")
-async def enable_auto_redeem():
+async def enable_auto_redeem(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    pk = body.get("private_key")
+    if pk and "..." not in pk:
+        from bot.config import normalize_private_key
+        try:
+            settings.PRIVATE_KEY = normalize_private_key(pk)
+        except Exception:
+            pass
+    clob_trader.reset()
     try:
         result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
         log_message("Auto-redeem enabled" if result.get("ok")
                     else f"Auto-redeem failed: {result.get('error')}")
-        return result
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        result = {"ok": False, "error": str(e)}
+
+    eoa_addr = clob_trader.get_eoa_address() if clob_trader else None
+    if not eoa_addr and settings.PRIVATE_KEY:
+        try:
+            from eth_account import Account
+            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
+        except Exception:
+            pass
+    result["eoa"] = eoa_addr
+    result["funder"] = (clob_trader.get_funder_address() if clob_trader else None) or eoa_addr
+    return result
 
 @app.get("/health")
 async def health():
